@@ -1,0 +1,13 @@
+1. decode raw IWR6843 radar data
+
+2. compute Range FFT + Range–Angle map
+
+3 .detect physical targets
+
+4. extract MVDR beams
+
+5 estimate HR and RR
+
+6. match estimates to ground truth
+
+7. save beams, metadata, and final CSV results
