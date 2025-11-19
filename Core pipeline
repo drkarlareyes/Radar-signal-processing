@@ -11,3 +11,212 @@
 6. match estimates to ground truth
 
 7. save beams, metadata, and final CSV results
+
+
+import os
+import re
+import glob
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt, hilbert, medfilt, find_peaks, welch
+
+
+
+def decode_iwr6843_data(filename, num_rx=4, num_adc_samples=256, num_chirps=128, header_bytes=0):
+    with open(filename, 'rb') as f:
+        f.seek(header_bytes)
+        raw = np.fromfile(f, dtype=np.int16)
+    raw = raw.reshape(-1, 2)
+    complex_data = raw[:, 0] + 1j * raw[:, 1]
+    samp_pf = num_rx * num_chirps * num_adc_samples
+    num_frames = len(complex_data) // samp_pf
+    adc = np.empty((num_frames, num_rx, num_chirps, num_adc_samples), dtype=complex)
+    for fr in range(num_frames):
+        for rx in range(num_rx):
+            st = fr * samp_pf + rx * (num_chirps * num_adc_samples)
+            en = st + (num_chirps * num_adc_samples)
+            adc[fr, rx] = complex_data[st:en].reshape(num_chirps, num_adc_samples)
+    return adc
+
+def compute_range_profiles(adc):
+    return np.fft.fft(adc, axis=-1)
+
+def compute_range_angle_map(rp, n_angle_bins=256):
+    avg_rx = rp.mean(axis=(0, 2))
+    ang = np.fft.fftshift(np.fft.fft(avg_rx, n=n_angle_bins, axis=0), axes=0)
+    return np.abs(ang).T
+
+def detect_targets_physical(ra_map, num_targets=2, min_dist_m=0.7, B=3.9e9, n_angle_bins=256, R_mean=4.0):
+    c = 3e8
+    rng_res = c / (2 * B)
+    min_rb = int(np.ceil(min_dist_m / rng_res))
+    ang_res = 180.0 / n_angle_bins
+    ang_sep = np.degrees(np.arcsin(min_dist_m / R_mean))
+    min_ab = int(np.ceil(ang_sep / ang_res))
+    R, A = ra_map.shape
+    idxs = np.argsort(ra_map.flatten())[::-1]
+    targets = []
+    for idx in idxs:
+        r, a = divmod(idx, A)
+        if r < min_rb or r > R - min_rb:
+            continue
+        if any(abs(r - r0) < min_rb and abs(a - a0) < min_ab for r0, a0 in targets):
+            continue
+        targets.append((r, a))
+        if len(targets) == num_targets:
+            break
+    return targets
+
+def separate_with_mvdr(adc, targets, n_angle_bins=256, fc=60e9, rng_win=3, eps=1e-6):
+    frames, num_rx, chirps, samples = adc.shape
+    rp = np.fft.fft(adc, axis=-1)
+    rng_bins = rp.shape[-1]
+    angle_axis = np.linspace(-90, 90, n_angle_bins)
+    def steer(theta):
+        lam = 3e8 / fc
+        d = lam / 2
+        k = 2 * np.pi / lam
+        idx = np.arange(num_rx)
+        return np.exp(-1j * k * d * idx * np.sin(np.deg2rad(theta)))[:, None]
+    beams = np.zeros((frames, len(targets)), dtype=complex)
+    for i, (rbin, abin) in enumerate(targets):
+        lo, hi = max(0, rbin - rng_win), min(rng_bins, rbin + rng_win + 1)
+        gated = rp[:, :, :, lo:hi]
+        X = gated.transpose(1, 0, 2, 3).reshape(num_rx, -1)
+        Rcov = X @ X.conj().T / X.shape[1] + eps * np.eye(num_rx)
+        a_vec = steer(angle_axis[abin])
+        w = np.linalg.inv(Rcov) @ a_vec
+        w /= (a_vec.conj().T @ np.linalg.inv(Rcov) @ a_vec)
+        for fr in range(frames):
+            Y = gated[fr].reshape(num_rx, -1)
+            beams[fr, i] = (w.conj().T @ Y).sum()
+    return beams
+
+def bandpass_filter(x, low, high, fs, order=4):
+    b, a = butter(order, [low / (fs / 2), high / (fs / 2)], btype='band')
+    return filtfilt(b, a, x)
+
+def estimate_rate_welch(x, fs, fmin, fmax):
+    f, P = welch(x, fs=fs, nperseg=min(len(x), int(5 * fs)))
+    mask = (f >= fmin) & (f <= fmax)
+    return (f[mask][np.argmax(P[mask])] * 60.0) if np.any(mask) else np.nan
+
+def estimate_hr_from_beam(z, fs):
+    phase = np.unwrap(np.angle(z))
+    dphi = np.gradient(phase) * fs / (2 * np.pi)
+    heart = bandpass_filter(dphi, 0.8, 3.0, fs, order=4)
+    return estimate_rate_welch(heart, fs, 0.8, 3.0)
+
+def estimate_rr_from_beam_peaks(z, fs, rr_band=(0.1, 0.6), order=4, min_rr=5, max_rr=35, medfilt_kernel=5, prom_factor=0.3):
+    phase = np.unwrap(np.angle(z))
+    dphi = np.gradient(phase) * fs / (2 * np.pi)
+    b, a = butter(order, [rr_band[0] / (fs / 2), rr_band[1] / (fs / 2)], btype='band')
+    instf = filtfilt(b, a, dphi)
+    env = np.abs(hilbert(instf))
+    env_s = medfilt(env, kernel_size=medfilt_kernel)
+    min_dist = int(fs * 60.0 / max_rr)
+    prom = prom_factor * np.std(env_s)
+    peaks, _ = find_peaks(env_s, distance=min_dist, prominence=prom)
+    if len(peaks) < 2:
+        return np.nan, peaks
+    ibis = np.diff(peaks) / fs
+    bpm = 60.0 / ibis
+    valid = bpm[(bpm >= min_rr) & (bpm <= max_rr)]
+    if len(valid) == 0:
+        return np.nan, peaks
+    return float(np.mean(valid)), peaks
+
+
+DATA_DIR = "plots"
+ANNOTATIONS_XLSX = "annotations.xlsx"
+OUT_CSV = "plots/annotation_with_estimates.csv"
+ALL_BEAMS_NPY = "plots/all_beams.npy"
+BEAM_META_CSV = "plots/all_beam_meta.csv"
+
+
+ann = pd.read_excel(ANNOTATIONS_XLSX)
+# if 'fname' not in ann.columns: print(ann.columns)
+
+def extract_num_patients(fname):
+    """Extract number of patients from file name like 'Man2' or 'Man3' (case-insensitive)."""
+    match = re.search(r"Man(\d+)", fname, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    else:
+        # default to 2 if not found
+        return 2
+
+results_rows = []
+all_beams = []
+all_beams_meta = []
+
+for idx, row in ann.iterrows():
+    fname = row['fname']
+    # Find the .bin file
+    bin_pattern = os.path.join(DATA_DIR, f"{fname}*.bin")
+    files = glob.glob(bin_pattern)
+    if not files:
+        print(f"SKIP: No file for {fname}")
+        continue
+    binfile = files[0]
+    
+    adc_samples = int(row['num_adc_samples']) if 'num_adc_samples' in row else 256
+    num_chirps = int(row['num_chirps']) if 'num_chirps' in row else 128
+    fs = float(row['framerate']) if 'framerate' in row else 40.0
+    num_targets = num_targets = extract_num_patients(fname)
+    gt_hr = row['gt_hr'] if 'gt_hr' in row else np.nan
+    gt_rr = row['gt_rr'] if 'gt_rr' in row else np.nan
+    
+    try:
+        adc = decode_iwr6843_data(binfile, num_rx=4, num_adc_samples=adc_samples, num_chirps=num_chirps)
+    except Exception as e:
+        print(f"Error decoding {binfile}: {e}")
+        continue
+    rp = compute_range_profiles(adc)
+    ra_map = compute_range_angle_map(rp, n_angle_bins=256)
+    targets = detect_targets_physical(ra_map, num_targets=num_targets, min_dist_m=0.7, B=3.9e9, n_angle_bins=256, R_mean=4.0)
+    beams = separate_with_mvdr(adc, targets, n_angle_bins=256, rng_win=3)
+    all_beams.append(beams)
+    
+    for i in range(beams.shape[1]):
+        z = beams[:, i]
+        hr_est = estimate_hr_from_beam(z, fs)
+        rr_est, peaks = estimate_rr_from_beam_peaks(z, fs, rr_band=(0.1, 0.6), order=4)
+        # Save results for meta CSV
+        beam_info = {
+            "fname": fname,
+            "beam_idx": i+1,
+            "gt_hr": gt_hr,
+            "gt_rr": gt_rr,
+            "hr_est": hr_est,
+            "rr_est": rr_est
+        }
+       l
+        for col in ann.columns:
+            beam_info[col] = row[col]
+        results_rows.append(beam_info)
+       
+        all_beams_meta.append({
+            "fname": fname,
+            "beam_idx": i+1,
+            "gt_hr": gt_hr,
+            "gt_rr": gt_rr
+        })
+
+# 3. Save results CSV and all beams
+results_df = pd.DataFrame(results_rows)
+results_df.to_csv(OUT_CSV, index=False)
+print(f"Saved annotation results with estimates to {OUT_CSV}")
+
+# Concatenate all beams and save
+if len(all_beams) > 0:
+    # Make shape [N, frames, targets] 
+    all_beams_array = np.concatenate([b for b in all_beams], axis=1)  # careful: axis=1 or 0 depending on desired stack
+    np.save(ALL_BEAMS_NPY, all_beams_array)
+    pd.DataFrame(all_beams_meta).to_csv(BEAM_META_CSV, index=False)
+    print(f"Saved all beams to {ALL_BEAMS_NPY} and {BEAM_META_CSV}")
+
+
+print("Stats:")
+print(results_df[['fname', 'gt_hr', 'hr_est', 'gt_rr', 'rr_est']].head())
+print("Done!")
