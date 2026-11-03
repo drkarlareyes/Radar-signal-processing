@@ -1,17 +1,14 @@
-1. decode raw IWR6843 radar data
+"""SiViS radar vital-sign pipeline (TI IWR6843, 60 GHz FMCW).
 
-2. compute Range FFT + Range–Angle map
-
-3 .detect physical targets
-
-4. extract MVDR beams
-
-5 estimate HR and RR
-
-6. match estimates to ground truth
-
-7. save beams, metadata, and final CSV results
-
+Steps:
+1. Decode raw IWR6843 radar data.
+2. Compute the range FFT and the range-angle map.
+3. Detect physical targets.
+4. Extract one MVDR beam per target.
+5. Estimate heart rate (HR) and respiration rate (RR).
+6. Store the estimates next to the reference values.
+7. Save beams, metadata and the final CSV.
+"""
 
 import os
 import re
@@ -163,7 +160,7 @@ for idx, row in ann.iterrows():
     adc_samples = int(row['num_adc_samples']) if 'num_adc_samples' in row else 256
     num_chirps = int(row['num_chirps']) if 'num_chirps' in row else 128
     fs = float(row['framerate']) if 'framerate' in row else 40.0
-    num_targets = num_targets = extract_num_patients(fname)
+    num_targets = extract_num_patients(fname)
     gt_hr = row['gt_hr'] if 'gt_hr' in row else np.nan
     gt_rr = row['gt_rr'] if 'gt_rr' in row else np.nan
     
@@ -191,7 +188,6 @@ for idx, row in ann.iterrows():
             "hr_est": hr_est,
             "rr_est": rr_est
         }
-       l
         for col in ann.columns:
             beam_info[col] = row[col]
         results_rows.append(beam_info)
